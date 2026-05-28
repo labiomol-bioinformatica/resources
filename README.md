@@ -1,4 +1,4 @@
-# Labiomol — Bioinformática
+# Labiomol - Bioinformática
 
 Repositório de recursos em bioinformática. Aqui ficam scripts de análise e matrizes de contagem processadas de projetos com dados públicos do lab.
 
