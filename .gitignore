@@ -1,0 +1,15 @@
+# Dados brutos (baixados automaticamente pelo download_geo.qmd)
+data/raw/
+
+# Arquivos antigos substituídos pelos RData
+data/processed/rnaseq/*.rds
+
+# PCA com typo no nome (substituído pelas versões corretas)
+data/processed/rnaseq/PCA_RNA_hamonized.tiff
+data/processed/microarray/PCA_Microarray_hamonized.tiff
+
+# R history
+.Rhistory
+scripts/.Rhistory
+.RData
+.Rproj.user/

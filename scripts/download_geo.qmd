@@ -1,0 +1,1163 @@
+---
+title: "Download e harmonização de coortes TNBC"
+format: html
+editor: visual
+editor_options:
+  chunk_output_type: console
+---
+
+## O que este script faz
+
+Este script baixa, limpa e harmoniza dados de expressão gênica de 6 coortes públicas de TNBC (câncer de mama triplo-negativo). Ao final produz 4 arquivos RData prontos para análise diferencial:
+
+**Fluxo por coorte:** baixar → limpar clínicos → salvar. A harmonização entre coortes (ComBat) é feita após baixar todas as coortes do mesmo grupo, e o save final vem depois da harmonização.
+
+------------------------------------------------------------------------
+
+## 1. Pacotes
+
+**Execute este bloco apenas uma vez** para instalar tudo. Depois deixe `eval: false` e rode só os `library()`.
+
+```{r}
+#| eval: false
+
+install.packages(c("BiocManager", "readxl", "httr"))
+BiocManager::install(c(
+  "GEOquery",      # baixa metadados e matrizes do GEO
+  "sva",           # ComBat e ComBat-seq para remoção de efeito de lote
+  "org.Hs.eg.db",  # banco de anotação humano: Entrez -> Ensembl -> símbolo
+  "AnnotationDbi", # interface para bancos de anotação do Bioconductor
+  "biomaRt",       # consulta Ensembl para filtrar genes por biótipo
+  "hgu133a.db",    # mapeamento probe -> gene para Affymetrix U133A
+  "edgeR"          # normalização CPM para RNA-seq
+))
+install.packages(c("ggplot2", "patchwork", "ggrepel"))
+```
+
+```{r}
+#| message: false
+
+library(GEOquery)
+library(sva)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+library(biomaRt)
+library(readxl)
+library(hgu133a.db)
+library(edgeR)
+library(ggplot2)
+library(patchwork)
+library(ggrepel)
+```
+
+------------------------------------------------------------------------
+
+## 2. Configuração
+
+```{r}
+raw_dir       <- "../data/raw/"
+processed_dir <- "../data/processed/"
+
+dir.create(raw_dir,                                showWarnings = FALSE, recursive = TRUE)
+dir.create(processed_dir,                          showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(processed_dir, "rnaseq"),     showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(processed_dir, "microarray"), showWarnings = FALSE, recursive = TRUE)
+```
+
+------------------------------------------------------------------------
+
+## 3. FUSCC
+
+A coorte FUSCC (Fudan University Shanghai Cancer Center) tem 360 tumores TNBC e 88 amostras de tecido mamário adjacente normal, com sobrevida disponível para a maioria (Jiang et al., Cancer Cell 2019; SRA: SRP157974). A convenção de nomes é: `FUSCCTNBC001` = tumor primário; `FUSCCTNBC001_PT` = peritumoral normal (PT = Peritumoral Tissue). Amostras com `_rep` são replicatas técnicas descartadas.
+
+### 3a. Baixar contagens
+
+```{r}
+fuscc_url     <- "https://ndownloader.figshare.com/files/35150692"
+fuscc_destino <- file.path(raw_dir, "FUSCC_RNAseqCount_hg38.tsv")
+
+download.file(fuscc_url, destfile = fuscc_destino, mode = "wb", quiet = FALSE)
+
+counts_fuscc_raw <- read.table(
+  fuscc_destino,
+  header      = TRUE,
+  sep         = "\t",
+  row.names   = 1,
+  check.names = FALSE
+)
+cat("FUSCC bruto:", nrow(counts_fuscc_raw), "genes x", ncol(counts_fuscc_raw), "amostras\n")
+```
+
+### 3b. Baixar metadados clínicos (mmc2)
+
+Os metadados clínicos da FUSCC estão na Tabela S1 do artigo original. Mantenha todas as colunas — elas contêm dados de subtipos moleculares, mutações, TILs, sobrevida e muito mais.
+
+```{r}
+# skip = 1 porque a primeira linha do Excel é um título, não o cabeçalho
+mmc2 <- suppressWarnings(
+  read_excel(file.path(raw_dir, "mmc2.xlsx"), sheet = 1, skip = 1)
+)
+cat("Pacientes na tabela clínica FUSCC:", nrow(mmc2), "| Colunas:", ncol(mmc2), "\n")
+```
+
+### 3c. Padronizar IDs de genes para Ensembl
+
+O FUSCC vem com rownames no formato `ENSG00000141510|TP53`. Separamos o Ensembl ID do símbolo e guardamos a tabela de correspondência para usar depois.
+
+```{r}
+partes_fuscc   <- strsplit(rownames(counts_fuscc_raw), "\\|")
+ensembl_fuscc  <- sapply(partes_fuscc, `[`, 1)
+simbolos_fuscc <- sapply(partes_fuscc, `[`, 2)
+
+# Manter apenas linhas com Ensembl ID válido e sem duplicatas
+unicos <- !duplicated(ensembl_fuscc) & grepl("^ENSG", ensembl_fuscc)
+counts_fuscc_ens           <- counts_fuscc_raw[unicos, ]
+rownames(counts_fuscc_ens) <- ensembl_fuscc[unicos]
+
+# Tabela de correspondência Ensembl -> símbolo para uso posterior
+ensembl_para_simbolo_fuscc <- setNames(simbolos_fuscc[unicos], ensembl_fuscc[unicos])
+
+cat("FUSCC com Ensembl ID:", nrow(counts_fuscc_ens), "genes\n")
+```
+
+### 3d. Separar amostras tumor vs normal
+
+```{r}
+amostras_sem_rep <- colnames(counts_fuscc_ens)[!grepl("_rep", colnames(counts_fuscc_ens))]
+normais_fuscc    <- amostras_sem_rep[grepl("_PT",  amostras_sem_rep)]   # 88 normais
+tumores_fuscc    <- amostras_sem_rep[!grepl("_PT", amostras_sem_rep)]   # 331 tumores
+
+counts_fuscc_ens <- counts_fuscc_ens[, amostras_sem_rep, drop = FALSE]
+
+cat("FUSCC tumor:", length(tumores_fuscc), "| normal adjacente:", length(normais_fuscc), "\n")
+```
+
+------------------------------------------------------------------------
+
+## 4. GSE58135
+
+Coorte com 42 TNBC primários e controles normais (mamoplastia redutora + tecido adjacente a TNBC). Espécimes cirúrgicos frescos congelados, mesmo protocolo da FUSCC — por isso entram juntos na harmonização tumor vs normal.
+
+### 4a. Baixar contagens e metadados
+
+O NCBI reprocessa todos os RNA-seq humanos com pipeline uniforme (HISAT2 + featureCounts, GRCh38), garantindo que estudos distintos sejam comparáveis.
+
+```{r}
+url_58135  <- paste0(
+  "https://www.ncbi.nlm.nih.gov/geo/download/",
+  "?type=rnaseq_counts&acc=GSE58135&format=file",
+  "&file=GSE58135_raw_counts_GRCh38.p13_NCBI.tsv.gz"
+)
+dest_58135 <- file.path(raw_dir, "GSE58135_raw_counts_NCBI.tsv.gz")
+
+download.file(url_58135, destfile = dest_58135, mode = "wb", quiet = FALSE)
+counts_58135 <- read.table(dest_58135, header = TRUE, sep = "\t",
+                            row.names = 1, check.names = FALSE)
+```
+
+```{r}
+#| message: false
+
+gse58135           <- getGEO("GSE58135", GSEMatrix = TRUE, destdir = raw_dir)
+clinical_58135_raw <- pData(gse58135[[1]])
+
+cat("GSE58135:", nrow(counts_58135), "genes x", ncol(counts_58135), "amostras\n")
+```
+
+### 4b. Filtrar amostras
+
+```{r}
+# Manter TNBC primário + tecido normal (mamoplastia e adjacente)
+# Excluir linhas celulares, tecido adjacente a tumor ER+ e metástases
+amostras_58135 <- clinical_58135_raw[
+  clinical_58135_raw$source_name_ch1 %in% c(
+    "Triple Negative Breast Cancer Primary Tumor",
+    "Reduction Mammoplasty - No known cancer",
+    "Uninvolved Breast Tissue Adjacent to TNBC Primary Tumor"
+  ), "geo_accession"
+]
+
+normais_58135 <- clinical_58135_raw[
+  clinical_58135_raw$source_name_ch1 %in% c(
+    "Reduction Mammoplasty - No known cancer",
+    "Uninvolved Breast Tissue Adjacent to TNBC Primary Tumor"
+  ), "geo_accession"
+]
+
+counts_58135 <- counts_58135[, amostras_58135, drop = FALSE]
+
+cat("GSE58135 selecionadas:", length(amostras_58135),
+    "(", length(normais_58135), "normais )\n")
+```
+
+------------------------------------------------------------------------
+
+## 5. RNA-seq harmonizado — tumor vs normal (FUSCC + GSE58135)
+
+O ComBat-seq precisa que os dois lotes compartilhem grupos biológicos (tumor e normal) para separar variação técnica de variação biológica real. FUSCC e GSE58135 têm amostras dos dois tipos — por isso entram juntos aqui. O GSE163882 (só tumor, biópsia pré-NAC) não pode entrar e é tratado separadamente na Seção 6.
+
+### 5a. Converter Entrez ID → Ensembl ID (GSE58135)
+
+As matrizes do NCBI usam Entrez ID como rownames. O Ensembl ID é o identificador estável que usamos para cruzar os dois estudos.
+
+```{r}
+# Função reutilizável: converte Entrez ID -> Ensembl ID
+# Mantém só mapeamentos 1:1 para evitar ambiguidade
+entrez_para_ensembl <- function(counts_matrix) {
+  mapa <- AnnotationDbi::select(
+    org.Hs.eg.db,
+    keys    = rownames(counts_matrix),
+    columns = c("ENSEMBL", "SYMBOL"),
+    keytype = "ENTREZID"
+  )
+  mapa <- mapa[
+    !is.na(mapa$ENSEMBL)       & !is.na(mapa$SYMBOL)      &
+    !duplicated(mapa$ENTREZID) & !duplicated(mapa$ENSEMBL) & !duplicated(mapa$SYMBOL),
+  ]
+  counts_filtrado           <- counts_matrix[mapa$ENTREZID, , drop = FALSE]
+  rownames(counts_filtrado) <- mapa$ENSEMBL
+  attr(counts_filtrado, "ensembl_to_symbol") <- setNames(mapa$SYMBOL, mapa$ENSEMBL)
+  counts_filtrado
+}
+
+counts_58135_ens <- entrez_para_ensembl(counts_58135)
+cat("GSE58135 com Ensembl ID:", nrow(counts_58135_ens), "genes\n")
+```
+
+### 5b. Genes em comum e vetor tipo
+
+```{r}
+coortes_harmonizacao <- list(
+  GSE58135 = counts_58135_ens,
+  FUSCC    = counts_fuscc_ens
+)
+
+genes_comuns <- Reduce(intersect, lapply(coortes_harmonizacao, rownames))
+cat("Genes em comum entre FUSCC e GSE58135:", length(genes_comuns), "\n")
+
+counts_sub <- lapply(coortes_harmonizacao, function(m) m[genes_comuns, , drop = FALSE])
+
+# IMPORTANTE: construir o vetor tipo ANTES do cbind
+# do.call(cbind) em lista NOMEADA adiciona o nome como prefixo nas colunas
+# unname() evita esse comportamento
+tipo <- c(
+  ifelse(colnames(counts_sub[["GSE58135"]]) %in% normais_58135, "normal", "tumor"),
+  ifelse(colnames(counts_sub[["FUSCC"]])    %in% normais_fuscc, "normal", "tumor")
+)
+
+counts_merged <- do.call(cbind, lapply(unname(counts_sub), as.matrix))
+
+cat("Tumor:", sum(tipo == "tumor"), "| Normal:", sum(tipo == "normal"), "\n")
+cat("Dimensões combinadas:", nrow(counts_merged), "genes x", ncol(counts_merged), "amostras\n")
+```
+
+### 5c. Filtrar genes proteico-codificantes
+
+O Ensembl classifica cada gene por biótipo. Manter só `protein_coding` reduz ruído sem excluir genes relevantes. Resultado esperado: ~18-20 mil genes.
+
+```{r}
+# Rodar o mart somente a primeira vez e salvar para reutilizar:
+# mart <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+# saveRDS(mart, file.path(raw_dir, "mart.rds"))
+
+mart <- readRDS(file.path(raw_dir, "mart.rds"))
+
+biotipos <- getBM(
+  attributes = c("ensembl_gene_id", "gene_biotype"),
+  filters    = "ensembl_gene_id",
+  values     = genes_comuns,
+  mart       = mart
+)
+
+proteicos_ensg <- biotipos$ensembl_gene_id[biotipos$gene_biotype == "protein_coding"]
+counts_merged  <- counts_merged[proteicos_ensg, , drop = FALSE]
+
+cat("Genes proteico-codificantes:", length(proteicos_ensg), "\n")
+cat("Dimensões após filtro:", nrow(counts_merged), "genes x", ncol(counts_merged), "amostras\n")
+```
+
+### 5d. Converter Ensembl ID → símbolo gênico
+
+Os rownames finais serão símbolos gênicos (TP53, BRCA1...) para facilitar a leitura dos resultados. Usamos a tabela da FUSCC como referência.
+
+```{r}
+simbolo_final <- ensembl_para_simbolo_fuscc[proteicos_ensg]
+
+# Genes sem símbolo na tabela FUSCC ficam com o Ensembl ID
+sem_simbolo <- is.na(simbolo_final)
+simbolo_final[sem_simbolo] <- proteicos_ensg[sem_simbolo]
+cat("Genes sem símbolo na tabela FUSCC:", sum(sem_simbolo), "\n")
+
+# Remove os poucos casos em que dois Ensembl IDs distintos mapeiam pro mesmo símbolo
+counts_merged <- counts_merged[!duplicated(simbolo_final), , drop = FALSE]
+simbolo_final <- simbolo_final[!duplicated(simbolo_final)]
+rownames(counts_merged) <- simbolo_final
+
+cat("Genes na matriz final:", nrow(counts_merged), "\n")
+```
+
+### 5e. ComBat-seq — remover efeito de lote
+
+O ComBat-seq é a versão do ComBat para dados de contagem. O parâmetro `covar_mod` informa que as diferenças tumor/normal são variação biológica real a ser preservada, não efeito de lote.
+
+```{r}
+batch     <- rep(names(counts_sub), sapply(counts_sub, ncol))
+covar_mod <- model.matrix(~ tipo)
+
+cat("Distribuição de tipo por lote:\n")
+print(table(tipo, batch))
+
+counts_harmonized <- ComBat_seq(
+  counts    = as.matrix(counts_merged),
+  batch     = batch,
+  covar_mod = covar_mod
+)
+
+cat("Matriz harmonizada:", nrow(counts_harmonized), "genes x",
+    ncol(counts_harmonized), "amostras\n")
+```
+
+### 5f. PCA pós ComBat-seq
+
+Antes da correção, PC1 separa as coortes. Depois, esperamos que tumor e normal se separem. Alguma separação residual entre coortes é normal — protocolos de sequenciamento diferentes não são 100% removíveis.
+
+```{r}
+log_counts <- log2(counts_harmonized + 1)
+vars       <- apply(log_counts, 1, var)
+top_genes  <- names(sort(vars, decreasing = TRUE)[1:2000])
+
+pca <- prcomp(t(log_counts[top_genes, ]), scale. = TRUE)
+pct <- round(100 * pca$sdev^2 / sum(pca$sdev^2), 1)
+
+# Contar n por lote e tipo para legenda informativa
+n_lote <- table(batch)
+n_tipo <- table(tipo)
+
+df_pca <- data.frame(
+  PC1  = pca$x[, 1],
+  PC2  = pca$x[, 2],
+  PC3  = pca$x[, 3],
+  lote = batch,
+  tipo = tipo
+)
+
+df_pca$lote_label <- paste0(df_pca$lote, " (n=", n_lote[df_pca$lote], ")")
+df_pca$tipo_label <- paste0(df_pca$tipo, " (n=", n_tipo[df_pca$tipo], ")")
+
+paleta <- c("#E41A1C", "#377EB8")
+
+lab_pc1 <- paste0("PC1 (", pct[1], "%)")
+lab_pc2 <- paste0("PC2 (", pct[2], "%)")
+lab_pc3 <- paste0("PC3 (", pct[3], "%)")
+
+p1 <- ggplot(df_pca, aes(PC1, PC2, color = lote_label, shape = tipo_label)) +
+  geom_point(alpha = 0.8, size = 2) +
+  scale_color_manual(values = paleta) +
+  theme_bw() +
+  labs(y = lab_pc2, color = "Coorte", shape = "Tipo") +
+  theme(axis.title.x = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+p2 <- ggplot(df_pca, aes(PC1, PC3, color = lote_label, shape = tipo_label)) +
+  geom_point(alpha = 0.8, size = 2) +
+  scale_color_manual(values = paleta) +
+  theme_bw() +
+  labs(x = lab_pc1, y = lab_pc3, color = "Coorte", shape = "Tipo")
+
+p3 <- ggplot(df_pca, aes(PC2, PC3, color = lote_label, shape = tipo_label)) +
+  geom_point(alpha = 0.8, size = 2) +
+  scale_color_manual(values = paleta) +
+  theme_bw() +
+  labs(x = lab_pc2, color = "Coorte", shape = "Tipo") +
+  theme(axis.title.y = element_blank(), axis.text.y = element_blank(), axis.ticks.y = element_blank())
+
+fig_rnaseq <- (p1 + plot_spacer()) / (p2 + p3) +
+  plot_layout(guides = "collect") +
+  plot_annotation(title = "PCA pós ComBat-seq - RNA-seq harmonizado (tumor vs normal)")
+
+print(fig_rnaseq)
+
+ggsave(
+  filename    = file.path(processed_dir, "rnaseq", "PCA_RNAseq_harmonized.tiff"),
+  plot        = fig_rnaseq,
+  width       = 10, height = 8, dpi = 300, bg = "white", compression = "lzw"
+)
+```
+
+### 5g. Montar metadados clínicos combinados
+
+```{r}
+# FUSCC: começa com colunas de identificação + merge com mmc2 (TODAS as colunas)
+clinical_fuscc <- data.frame(
+  sample_id = tumores_fuscc,
+  cohort    = "FUSCC",
+  tipo      = "tumor",
+  row.names = tumores_fuscc
+)
+fuscc_match <- match(tumores_fuscc, mmc2$Project_ID)
+for (col in colnames(mmc2)) clinical_fuscc[[col]] <- mmc2[[col]][fuscc_match]
+
+clinical_fuscc_normal <- data.frame(
+  sample_id = normais_fuscc,
+  cohort    = "FUSCC",
+  tipo      = "normal",
+  row.names = normais_fuscc
+)
+fuscc_normal_match <- match(normais_fuscc, mmc2$Project_ID)
+for (col in colnames(mmc2)) clinical_fuscc_normal[[col]] <- mmc2[[col]][fuscc_normal_match]
+
+clinical_fuscc_all <- rbind(clinical_fuscc, clinical_fuscc_normal)
+
+# GSE58135: todas as colunas disponíveis no GEO
+clinical_58135 <- clinical_58135_raw[
+  match(amostras_58135, clinical_58135_raw$geo_accession), ]
+rownames(clinical_58135) <- amostras_58135
+clinical_58135$sample_id <- amostras_58135
+clinical_58135$cohort    <- "GSE58135"
+clinical_58135$tipo      <- ifelse(amostras_58135 %in% normais_58135, "normal", "tumor")
+
+# Combinar FUSCC + GSE58135 mantendo TODAS as colunas (NA para colunas não comuns)
+todas_colunas <- union(colnames(clinical_fuscc_all), colnames(clinical_58135))
+clinical_combined <- data.frame(matrix(NA, nrow = 0, ncol = length(todas_colunas)))
+colnames(clinical_combined) <- todas_colunas
+
+for (col in colnames(clinical_fuscc_all))
+  clinical_combined[rownames(clinical_fuscc_all), col] <- clinical_fuscc_all[[col]]
+for (col in colnames(clinical_58135))
+  clinical_combined[rownames(clinical_58135), col] <- clinical_58135[[col]]
+
+# Marcar tipo de sobrevida e converter RFS para anos
+if (!"survival_type" %in% colnames(clinical_combined)) clinical_combined$survival_type <- NA
+idx_rfs <- clinical_combined$cohort == "FUSCC" & !is.na(clinical_combined$RFS_Status)
+clinical_combined[idx_rfs, "survival_type"] <- "RFS"
+clinical_combined$RFS_years <- clinical_combined$RFS_time_Months / 12
+
+cat("Clinical combinado bruto:", nrow(clinical_combined), "amostras x",
+    ncol(clinical_combined), "colunas\n")
+```
+
+### 5h. Limpar metadados clínicos
+
+```{r}
+# Remover colunas 100% técnicas/administrativas (não agregam para análise biológica)
+cols_deletar <- c(
+  "contact_name", "contact_email", "contact_laboratory", "contact_department",
+  "contact_institute", "contact_address", "contact_city", "contact_state",
+  "contact_zip/postal_code", "contact_country",
+  "growth_protocol_ch1", "extract_protocol_ch1", "extract_protocol_ch1.1",
+  "molecule_ch1", "taxid_ch1",
+  "data_processing", "data_processing.1", "data_processing.2",
+  "data_processing.3", "data_processing.4",
+  "supplementary_file_1", "supplementary_file_2",
+  "relation", "relation.1",
+  "platform_id", "instrument_model", "channel_count",
+  "library_selection", "library_source", "library_strategy",
+  "data_row_count", "submission_date", "last_update_date",
+  "status", "type", "organism_ch1",
+  "tissue:ch1", "characteristics_ch1"
+)
+clinical_combined <- clinical_combined[, !colnames(clinical_combined) %in% cols_deletar]
+
+# Converter strings "NA" → NA real em TODAS as colunas character
+for (col in colnames(clinical_combined)) {
+  if (is.character(clinical_combined[[col]]))
+    clinical_combined[[col]][clinical_combined[[col]] == "NA"] <- NA
+}
+
+# Converter character → numeric
+for (col in c("Ascat_ACF", "Ascat_Ploidy", "LSTm", "Telomeric AI", "LOH", "HRD",
+              "sTILs", "iTILs", "Ki67", "Size_cm", "LN_examed", "LN_positive",
+              "Grade", "T", "N")) {
+  if (col %in% colnames(clinical_combined))
+    clinical_combined[[col]] <- as.numeric(clinical_combined[[col]])
+}
+
+# Converter character → logical
+for (col in c("BRCA1/2 MUT 20160718", "BRCA1 MUT 20160718", "BRCA2 MUT 20160718", "Radiotherapy")) {
+  if (col %in% colnames(clinical_combined))
+    clinical_combined[[col]] <- as.logical(clinical_combined[[col]])
+}
+
+# Converter unix timestamp → Date
+for (col in c("Date_of_surgery", "Date_of_last_followup")) {
+  if (col %in% colnames(clinical_combined))
+    clinical_combined[[col]] <- as.Date(clinical_combined[[col]], origin = "1970-01-01")
+}
+
+cat("  clinical_combined limpo:", ncol(clinical_combined), "colunas\n")
+print(table(clinical_combined$tipo, clinical_combined$cohort))
+```
+
+### 5i. Salvar
+
+```{r}
+save(counts_harmonized, clinical_combined,
+     file     = file.path(processed_dir, "rnaseq", "TNBC_harmonized.RData"),
+     compress = "xz")
+
+cat("  TNBC_harmonized.RData salvo\n")
+cat("  Expressão:", nrow(counts_harmonized), "genes x", ncol(counts_harmonized), "amostras\n")
+cat("  Clínico:  ", ncol(clinical_combined), "colunas\n")
+```
+
+------------------------------------------------------------------------
+
+## 6. GSE163882 — validação quimioresistência (RNA-seq)
+
+Biópsias pré-NAC de TNBC com desfecho pCR/RD conhecido. Não entra na harmonização tumor/normal da Seção 5 por dois motivos: (1) é biópsia de agulha pré-quimioterapia, protocolo diferente dos espécimes cirúrgicos da FUSCC e GSE58135; (2) não tem amostras normais, que o ComBat-seq precisa como referência compartilhada. Usado como coorte independente para validar resultados de quimioresistência.
+
+### 6a. Baixar contagens e metadados
+
+```{r}
+url_163882  <- paste0(
+  "https://www.ncbi.nlm.nih.gov/geo/download/",
+  "?type=rnaseq_counts&acc=GSE163882&format=file",
+  "&file=GSE163882_raw_counts_GRCh38.p13_NCBI.tsv.gz"
+)
+dest_163882 <- file.path(raw_dir, "GSE163882_raw_counts_NCBI.tsv.gz")
+
+download.file(url_163882, destfile = dest_163882, mode = "wb", quiet = FALSE)
+counts_163882_raw <- read.table(dest_163882, header = TRUE, sep = "\t",
+                                row.names = 1, check.names = FALSE)
+```
+
+```{r}
+#| message: false
+
+gse163882           <- getGEO("GSE163882", GSEMatrix = TRUE, destdir = raw_dir)
+clinical_163882_raw <- pData(gse163882[[1]])
+
+cat("GSE163882:", nrow(counts_163882_raw), "genes x", ncol(counts_163882_raw), "amostras\n")
+```
+
+### 6b. Filtrar TNBC e converter IDs
+
+```{r}
+amostras_163882 <- clinical_163882_raw[
+  clinical_163882_raw[["estrogen receptor status:ch1"]]     == "N" &
+  clinical_163882_raw[["progesterone receptor status:ch1"]] == "N" &
+  clinical_163882_raw[["her2 receptor status:ch1"]]         == "N",
+  "geo_accession"
+]
+
+counts_163882_raw <- counts_163882_raw[, amostras_163882, drop = FALSE]
+
+# Reutiliza a função entrez_para_ensembl definida na Seção 5a
+counts_163882     <- entrez_para_ensembl(counts_163882_raw)
+
+cat("GSE163882 TNBC:", length(amostras_163882), "amostras\n")
+```
+
+### 6c. Montar e limpar metadados clínicos
+
+```{r}
+clinical_163882 <- clinical_163882_raw[
+  match(amostras_163882, clinical_163882_raw$geo_accession), ]
+rownames(clinical_163882) <- amostras_163882
+
+clinical_163882$sample_id <- amostras_163882
+clinical_163882$cohort    <- "GSE163882"
+clinical_163882$tipo      <- "tumor"
+
+# Resposta à NAC
+nac_raw <- clinical_163882[, "characteristics_ch1"]
+clinical_163882$nac_response <- sub("response to nac: ", "", nac_raw)
+clinical_163882$nac_response <- as.character(clinical_163882$nac_response)
+clinical_163882$nac_response[clinical_163882$nac_response == "1"] <- "pCR"
+clinical_163882$nac_response[clinical_163882$nac_response == "0"] <- "RD"
+
+clinical_163882$treatment <- "Taxane-based (regime nao especificado)"
+
+# Manter apenas colunas biologicamente relevantes
+clinical_163882 <- clinical_163882[, colnames(clinical_163882) %in% c(
+  "sample_id", "cohort", "tipo", "geo_accession", "nac_response", "treatment"
+)]
+
+cat("pCR/RD em GSE163882:\n")
+print(table(clinical_163882$nac_response, useNA = "always"))
+```
+
+### 6d. Salvar
+
+```{r}
+save(counts_163882, clinical_163882,
+     file     = file.path(processed_dir, "rnaseq", "TNBC_gse163882.RData"),
+     compress = "xz")
+
+cat("  TNBC_gse163882.RData salvo\n")
+cat("  Expressão:", nrow(counts_163882), "genes x", ncol(counts_163882), "amostras\n")
+```
+
+------------------------------------------------------------------------
+
+## 7. Microarray — quimioresistência pré-NAC (4 coortes Affymetrix U133A)
+
+Os quatro datasets são todos Affymetrix U133A (GPL96), coletados de biópsias pré-NAC com desfecho pCR/RD. A plataforma idêntica garante mapeamento de probes consistente e permite usar o ComBat clássico (dados já em log2 normalizado pelo estudo original, tipicamente RMA). O GSE163882 (RNA-seq) não entra aqui — tecnologias diferentes não devem ser misturadas em uma mesma correção de lote.
+
+### 7a. Baixar datasets
+
+```{r}
+#| message: false
+
+gse_array_ids <- c("GSE20271", "GSE25055", "GSE25065", "GSE20194")
+
+gse_array <- lapply(gse_array_ids, function(id) {
+  getGEO(id, GSEMatrix = TRUE, destdir = raw_dir)
+})
+names(gse_array) <- gse_array_ids
+```
+
+### 7b. Inspecionar e filtrar TNBC
+
+```{r}
+# Inspecionar colunas de receptores em cada cohort (executar uma vez para verificar)
+for (id in gse_array_ids) {
+  pd   <- pData(gse_array[[id]][[1]])
+  cols <- grep("er|estrogen|pr|progesterone|her2|erbb2|receptor|subtype|response|pcr|nac",
+               colnames(pd), ignore.case = TRUE, value = TRUE)
+  cat("\n===", id, "===\n")
+  cat("Colunas relevantes:", paste(cols, collapse = " | "), "\n")
+  cat("Amostras totais:", nrow(pd), "\n")
+}
+```
+
+```{r}
+tnbc_amostras <- list(
+
+  GSE20194 = {
+    pd <- pData(gse_array[["GSE20194"]][[1]])
+    rownames(pd)[
+      pd[["er_status:ch1"]]   %in% "N" &
+      pd[["pr_status:ch1"]]   %in% "N" &
+      pd[["her2 status:ch1"]] %in% "N"
+    ]
+  },
+
+  GSE20271 = {
+    pd <- pData(gse_array[["GSE20271"]][[1]])
+    rownames(pd)[
+      pd[["er status:ch1"]]    %in% "N" &
+      pd[["pr status:ch1"]]    %in% "N" &
+      pd[["her 2 status:ch1"]] %in% "N"
+    ]
+  },
+
+  GSE25055 = {
+    pd <- pData(gse_array[["GSE25055"]][[1]])
+    rownames(pd)[
+      pd[["er_status_ihc:ch1"]] %in% "N" &
+      pd[["pr_status_ihc:ch1"]] %in% "N" &
+      pd[["her2_status:ch1"]]   %in% "N"
+    ]
+  },
+
+  GSE25065 = {
+    pd <- pData(gse_array[["GSE25065"]][[1]])
+    rownames(pd)[
+      pd[["er_status_ihc:ch1"]] %in% "N" &
+      pd[["pr_status_ihc:ch1"]] %in% "N" &
+      pd[["her2_status:ch1"]]   %in% "N"
+    ]
+  }
+)
+
+for (id in gse_array_ids) cat(id, "- TNBC:", length(tnbc_amostras[[id]]), "\n")
+```
+
+### 7c. Extrair matrizes de expressão
+
+```{r}
+expr_array <- lapply(gse_array_ids, function(id) {
+  mat <- exprs(gse_array[[id]][[1]])
+  mat <- mat[, tnbc_amostras[[id]], drop = FALSE]
+  # Força log2 caso o dataset venha em escala linear (max > 50 é sinal disso)
+  if (max(mat, na.rm = TRUE) > 50) {
+    message(id, ": transformando para log2")
+    mat <- log2(mat + 1)
+  }
+  mat
+})
+names(expr_array) <- gse_array_ids
+lapply(expr_array, dim)
+```
+
+### 7d. Mapear probes para símbolos gênicos
+
+A plataforma U133A tem múltiplos probes por gene. Mantemos o probe de maior variância por gene.
+
+```{r}
+mapa_u133a <- AnnotationDbi::select(
+  hgu133a.db,
+  keys    = rownames(expr_array[[1]]),
+  columns = "SYMBOL",
+  keytype = "PROBEID"
+)
+mapa_u133a <- mapa_u133a[!is.na(mapa_u133a$SYMBOL) & !duplicated(mapa_u133a$PROBEID), ]
+
+colapsar_probes <- function(mat, mapa) {
+  mat           <- mat[mapa$PROBEID, , drop = FALSE]
+  rownames(mat) <- mapa$SYMBOL
+  vars          <- apply(mat, 1, var)
+  mat           <- mat[order(vars, decreasing = TRUE), ]
+  mat[!duplicated(rownames(mat)), ]
+}
+
+expr_genes <- lapply(expr_array, colapsar_probes, mapa = mapa_u133a)
+lapply(expr_genes, dim)
+```
+
+### 7e. ComBat — remover efeito de lote
+
+```{r}
+genes_comuns_array <- Reduce(intersect, lapply(expr_genes, rownames))
+cat("Genes em comum nos 4 datasets:", length(genes_comuns_array), "\n")
+
+expr_sub    <- lapply(expr_genes, function(m) m[genes_comuns_array, , drop = FALSE])
+expr_merged <- do.call(cbind, lapply(unname(expr_sub), as.matrix))
+
+batch_array <- rep(names(expr_sub), sapply(expr_sub, ncol))
+print(table(batch_array))
+
+# ComBat clássico — dados já em log2, todos os lotes são tumor pré-NAC
+# Sem necessidade de covar_mod: não há variação biológica a proteger aqui
+expr_harmonized_array <- ComBat(
+  dat   = expr_merged,
+  batch = batch_array
+)
+
+cat("Microarray harmonizado:", nrow(expr_harmonized_array), "genes x",
+    ncol(expr_harmonized_array), "amostras\n")
+```
+
+### 7f. PCA pós ComBat
+
+```{r}
+vars_arr <- apply(expr_harmonized_array, 1, var)
+top_arr  <- names(sort(vars_arr, decreasing = TRUE)[1:2000])
+pca_arr  <- prcomp(t(expr_harmonized_array[top_arr, ]), scale. = TRUE)
+pct_arr  <- round(100 * pca_arr$sdev^2 / sum(pca_arr$sdev^2), 1)
+
+# Labels com n amostral por coorte
+n_lote_arr <- table(batch_array)
+
+df_pca_arr <- data.frame(
+  PC1  = pca_arr$x[, 1],
+  PC2  = pca_arr$x[, 2],
+  PC3  = pca_arr$x[, 3],
+  lote = batch_array
+)
+df_pca_arr$lote_label <- paste0(df_pca_arr$lote, " (n=", n_lote_arr[df_pca_arr$lote], ")")
+
+paleta_contraste <- c("#E41A1C", "#377EB8", "#4DAF4A", "#984EA3")
+
+lab_pc1 <- paste0("PC1 (", pct_arr[1], "%)")
+lab_pc2 <- paste0("PC2 (", pct_arr[2], "%)")
+lab_pc3 <- paste0("PC3 (", pct_arr[3], "%)")
+
+p1 <- ggplot(df_pca_arr, aes(PC1, PC2, color = lote_label)) +
+  geom_point(alpha = 0.8, size = 2) +
+  scale_color_manual(values = paleta_contraste) +
+  theme_bw() +
+  labs(y = lab_pc2, color = "Coorte") +
+  theme(axis.title.x = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+p2 <- ggplot(df_pca_arr, aes(PC1, PC3, color = lote_label)) +
+  geom_point(alpha = 0.8, size = 2) +
+  scale_color_manual(values = paleta_contraste) +
+  theme_bw() +
+  labs(x = lab_pc1, y = lab_pc3, color = "Coorte")
+
+p3 <- ggplot(df_pca_arr, aes(PC2, PC3, color = lote_label)) +
+  geom_point(alpha = 0.8, size = 2) +
+  scale_color_manual(values = paleta_contraste) +
+  theme_bw() +
+  labs(x = lab_pc2, color = "Coorte") +
+  theme(axis.title.y = element_blank(), axis.text.y = element_blank(), axis.ticks.y = element_blank())
+
+fig_array <- (p1 + plot_spacer()) / (p2 + p3) +
+  plot_layout(guides = "collect") +
+  plot_annotation(title = "PCA pós ComBat - Microarray harmonizado (4 coortes)")
+
+print(fig_array)
+
+ggsave(
+  filename    = file.path(processed_dir, "microarray", "PCA_Microarray_harmonized.tiff"),
+  plot        = fig_array,
+  width       = 10, height = 8, dpi = 300, bg = "white", compression = "lzw"
+)
+```
+
+### 7g. Montar metadados clínicos
+
+```{r}
+# Extrair TODAS as colunas disponíveis por cohort e combinar
+clinical_array_list <- list()
+for (id in gse_array_ids) {
+  pd <- pData(gse_array[[id]][[1]])
+  clinical_array_list[[id]]            <- pd[tnbc_amostras[[id]], ]
+  rownames(clinical_array_list[[id]])  <- tnbc_amostras[[id]]
+  clinical_array_list[[id]]$sample_id  <- tnbc_amostras[[id]]
+  clinical_array_list[[id]]$cohort     <- id
+}
+
+todas_colunas_arr <- Reduce(union, lapply(clinical_array_list, colnames))
+clinical_array    <- data.frame(matrix(NA, nrow = 0, ncol = length(todas_colunas_arr)))
+colnames(clinical_array) <- todas_colunas_arr
+
+for (id in gse_array_ids)
+  for (col in colnames(clinical_array_list[[id]]))
+    clinical_array[rownames(clinical_array_list[[id]]), col] <- clinical_array_list[[id]][[col]]
+
+# Extrair e padronizar resposta à NAC
+for (id in gse_array_ids) {
+  pd       <- pData(gse_array[[id]][[1]])
+  idx      <- clinical_array$cohort == id
+  col_resp <- grep("response|pcr|pCR|RD|residual|path",
+                   colnames(pd), ignore.case = TRUE, value = TRUE)
+  if (length(col_resp) > 0)
+    clinical_array[idx, "nac_response"] <- pd[tnbc_amostras[[id]], col_resp[1]]
+}
+
+clinical_array$nac_response <- as.character(clinical_array$nac_response)
+clinical_array$nac_response[clinical_array$nac_response == "1"] <- "pCR"
+clinical_array$nac_response[clinical_array$nac_response == "0"] <- "RD"
+# Manter SÓ pCR e RD — remover valores inválidos (ex: RCB class 2/3)
+clinical_array$nac_response[!clinical_array$nac_response %in% c("pCR", "RD")] <- NA
+
+# Extrair tratamento por cohort
+for (id in gse_array_ids) {
+  pd  <- pData(gse_array[[id]][[1]])
+  idx <- clinical_array$cohort == id
+
+  if (id == "GSE20271") {
+    trat <- pd[tnbc_amostras[[id]], "treatment received (1=fac, 2=t/fac):ch1"]
+    clinical_array[idx, "treatment_standardized"] <- ifelse(trat == 1, "FAC",
+                                                    ifelse(trat == 2, "T/FAC", NA))
+  }
+  if (id == "GSE20194") {
+    clinical_array[idx, "treatment_standardized"] <-
+      pd[tnbc_amostras[[id]], "treatment code:ch1"]
+  }
+  if (id == "GSE25055") {
+    clinical_array[idx, "treatment_standardized"] <- NA
+  }
+  if (id == "GSE25065") {
+    clinical_array[idx, "treatment_standardized"] <-
+      pd[tnbc_amostras[[id]], "type_taxane:ch1"]
+  }
+}
+
+# Marcar tipo de sobrevida
+for (id in c("GSE25055", "GSE25065")) {
+  clinical_array[clinical_array$cohort == id, "survival_type"] <- "DRFS"
+}
+
+cat("pCR/RD por coorte:\n")
+print(table(clinical_array$nac_response, clinical_array$cohort, useNA = "always"))
+```
+
+### 7h. Limpar metadados clínicos
+
+```{r}
+# Remover colunas técnicas/administrativas
+cols_deletar_array <- c(
+  "contact_name", "contact_email", "contact_laboratory", "contact_department",
+  "contact_institute", "contact_address", "contact_city", "contact_state",
+  "contact_zip/postal_code", "contact_country", "contact_phone", "contact_web_link",
+  "treatment_protocol_ch1", "growth_protocol_ch1", "extract_protocol_ch1",
+  "label_ch1", "label_protocol_ch1", "hyb_protocol", "scan_protocol",
+  "molecule_ch1", "taxid_ch1",
+  "platform_id", "channel_count", "organism_ch1",
+  "data_processing", "data_row_count",
+  "submission_date", "last_update_date", "status", "type",
+  "supplementary_file", "relation", "relation.1", "relation.2",
+  "description", "description.1",
+  "tissue:ch1", "source:ch1", "sample id:ch1"
+)
+clinical_array <- clinical_array[, !colnames(clinical_array) %in% cols_deletar_array]
+
+# Converter strings "NA" → NA real
+for (col in colnames(clinical_array)) {
+  if (is.character(clinical_array[[col]]))
+    clinical_array[[col]][clinical_array[[col]] == "NA"] <- NA
+}
+
+# Converter character → numeric
+for (col in c("age:ch1", "drfs_even_time_years:ch1", "age_years:ch1",
+              "prechemo t:ch1", "prechemo n:ch1")) {
+  if (col %in% colnames(clinical_array))
+    clinical_array[[col]] <- as.numeric(clinical_array[[col]])
+}
+
+# Limpar post chemo size (tem valores especiais como "N/A", "ND", "residual cancer")
+if ("post chemo size cm:ch1" %in% colnames(clinical_array)) {
+  clinical_array$`post chemo size cm:ch1`[
+    clinical_array$`post chemo size cm:ch1` %in% c("N/A", "ND", "residual cancer")] <- NA
+  clinical_array$`post chemo size cm:ch1` <- as.numeric(clinical_array$`post chemo size cm:ch1`)
+}
+
+cat("  clinical_array limpo:", ncol(clinical_array), "colunas\n")
+```
+
+### 7i. Salvar
+
+```{r}
+save(expr_harmonized_array, clinical_array,
+     file     = file.path(processed_dir, "microarray", "TNBC_microarray.RData"),
+     compress = "xz")
+
+cat("  TNBC_microarray.RData salvo\n")
+cat("  Expressão:", nrow(expr_harmonized_array), "genes x", ncol(expr_harmonized_array), "amostras\n")
+cat("  Clínico:  ", ncol(clinical_array), "colunas\n")
+```
+
+------------------------------------------------------------------------
+
+## 8. GSE32603 — I-SPY 1 longitudinal (Agilent)
+
+Coorte com biópsias em 3 timepoints por paciente: T1 (pré-tratamento), T2 (após 4 ciclos AC) e TS (pré-cirurgia). Plataforma Agilent (GPL14668), diferente do U133A, portanto processada e armazenada separadamente. A análise longitudinal usa `duplicateCorrelation` no limma para contabilizar as medidas repetidas.
+
+### 8a. Baixar e filtrar TNBC
+
+```{r}
+#| message: false
+
+gse32603   <- getGEO("GSE32603", GSEMatrix = TRUE, destdir = raw_dir)
+expr_32603 <- exprs(gse32603[[1]])
+pd_32603   <- pData(gse32603[[1]])
+fd_32603   <- fData(gse32603[[1]])
+
+cat("GSE32603 bruto:", nrow(expr_32603), "probes x", ncol(expr_32603), "amostras\n")
+```
+
+```{r}
+# TNBC: HR- (.6) e HER2- (.7)
+# .6 = "hr-positive_yes is 1: 0/1" onde 0 = HR- (= ER- E PR-)
+# .7 = "her2-positive_yes is 1: 0/1" onde 0 = HER2-
+# Combinado: ER- AND PR- AND HER2- = triplo negativo
+is_tnbc_32603 <- grepl("0", pd_32603$characteristics_ch1.6) &
+                 grepl("0", pd_32603$characteristics_ch1.7)
+is_tnbc_32603[is.na(is_tnbc_32603)] <- FALSE
+
+idx_tnbc        <- which(is_tnbc_32603)
+expr_32603_tnbc <- expr_32603[, idx_tnbc, drop = FALSE]
+pd_32603_tnbc   <- pd_32603[idx_tnbc, ]
+
+cat("TNBC filtrado:", ncol(expr_32603_tnbc), "amostras\n")
+```
+
+### 8b. Mapear probes para genes
+
+O Agilent armazena gene symbols em `gene_assignment`. Alguns probes mapeiam para múltiplos genes — manter só o primeiro.
+
+```{r}
+col_symbol <- grep("symbol|gene_assignment|genename", colnames(fd_32603),
+                   ignore.case = TRUE, value = TRUE)[1]
+
+simbolos_brutos   <- fd_32603[rownames(expr_32603_tnbc), col_symbol]
+simbolos_limpos   <- sapply(strsplit(as.character(simbolos_brutos), " // "), `[`, 1)
+
+rownames(expr_32603_tnbc) <- ifelse(
+  is.na(simbolos_limpos) | simbolos_limpos == "",
+  rownames(expr_32603_tnbc),
+  simbolos_limpos
+)
+expr_32603_tnbc <- expr_32603_tnbc[!duplicated(rownames(expr_32603_tnbc)), ]
+
+cat("Genes após mapeamento:", nrow(expr_32603_tnbc), "\n")
+```
+
+### 8c. Montar e limpar metadados clínicos
+
+```{r}
+clinical_32603 <- pd_32603_tnbc
+rownames(clinical_32603) <- rownames(pd_32603_tnbc)
+
+clinical_32603$sample_id  <- rownames(pd_32603_tnbc)
+clinical_32603$cohort     <- "GSE32603"
+clinical_32603$timepoint  <- pd_32603_tnbc[["biopsy time:ch1"]]
+clinical_32603$patient_id <- gsub(".*_patient_([0-9]+).*", "\\1", pd_32603_tnbc$title)
+
+# Tratamento: characteristics_ch1.2 = "treatment: F1/F2"
+if ("characteristics_ch1.2" %in% colnames(clinical_32603)) {
+  clinical_32603$treatment <- sub("treatment: ", "", clinical_32603[["characteristics_ch1.2"]])
+}
+
+# Sobrevida RFS em dias e anos
+if ("characteristics_ch1.4" %in% colnames(clinical_32603)) {
+  clinical_32603$rfs_days      <- as.numeric(sub("rfs_days: ", "", clinical_32603[["characteristics_ch1.4"]]))
+  clinical_32603$rfs_years     <- clinical_32603$rfs_days / 365.25
+  clinical_32603$survival_type <- "RFS"
+}
+
+# Evento de recorrência: 1 = recorrência, 0 = sem recorrência
+if ("characteristics_ch1.5" %in% colnames(clinical_32603)) {
+  clinical_32603$recurrence_event <- as.numeric(
+    sub("recurrence_yes is 1: ", "", clinical_32603[["characteristics_ch1.5"]]))
+}
+
+# pCR/RD: characteristics_ch1.8 = "pcr_yes is 1: 0/1"
+if ("characteristics_ch1.8" %in% colnames(clinical_32603)) {
+  pcr_raw <- sub("pcr_yes is 1: ", "", clinical_32603[["characteristics_ch1.8"]])
+  clinical_32603$nac_response <- ifelse(pcr_raw == "1", "pCR",
+                                        ifelse(pcr_raw == "0", "RD", NA))
+}
+
+# Limpar colunas técnicas
+cols_deletar_32603 <- c(
+  "contact_name", "contact_laboratory", "contact_department", "contact_institute",
+  "contact_address", "contact_city", "contact_state", "contact_zip/postal_code", "contact_country",
+  "treatment_protocol_ch1", "treatment_protocol_ch2",
+  "molecule_ch1", "molecule_ch2",
+  "extract_protocol_ch1", "extract_protocol_ch2",
+  "label_ch1", "label_ch2", "label_protocol_ch1", "label_protocol_ch2",
+  "taxid_ch1", "taxid_ch2", "hyb_protocol", "scan_protocol",
+  "organism_ch1", "organism_ch2",
+  "source_name_ch2", "characteristics_ch2",
+  "platform_id", "data_processing", "data_row_count",
+  "submission_date", "last_update_date", "status", "type", "channel_count",
+  "supplementary_file", "reference:ch2"
+)
+clinical_32603 <- clinical_32603[, !colnames(clinical_32603) %in% cols_deletar_32603]
+
+# Converter strings "NA" → NA real
+for (col in colnames(clinical_32603)) {
+  if (is.character(clinical_32603[[col]]))
+    clinical_32603[[col]][clinical_32603[[col]] == "NA"] <- NA
+}
+
+# Converter numéricas
+for (col in c("rfs_days:ch1", "rcb index:ch1")) {
+  if (col %in% colnames(clinical_32603))
+    clinical_32603[[col]] <- as.numeric(clinical_32603[[col]])
+}
+
+cat("  clinical_32603 limpo:", ncol(clinical_32603), "colunas\n")
+cat("Distribuição de timepoints:\n")
+print(table(clinical_32603$timepoint, useNA = "always"))
+cat("\nDistribuição pCR/RD:\n")
+print(table(clinical_32603$nac_response, useNA = "always"))
+```
+
+### 8d. Salvar
+
+```{r}
+save(expr_32603_tnbc, clinical_32603,
+     file     = file.path(processed_dir, "microarray", "TNBC_gse32603.RData"),
+     compress = "xz")
+
+cat("  TNBC_gse32603.RData salvo\n")
+cat("  Expressão:", nrow(expr_32603_tnbc), "genes x", ncol(expr_32603_tnbc), "amostras\n")
+cat("  Clínico:  ", ncol(clinical_32603), "colunas\n")
+```
+
+------------------------------------------------------------------------
+
+## 9. Resumo dos datasets
+
+```{r}
+# Recarregar todos os arquivos para garantir que estão atualizados
+load(file.path(processed_dir, "rnaseq",     "TNBC_harmonized.RData"))
+load(file.path(processed_dir, "rnaseq",     "TNBC_gse163882.RData"))
+load(file.path(processed_dir, "microarray", "TNBC_microarray.RData"))
+load(file.path(processed_dir, "microarray", "TNBC_gse32603.RData"))
+
+resumo <- rbind(
+
+  # RNA-seq harmonizado: uma linha por coorte
+  do.call(rbind, lapply(unique(clinical_combined$cohort), function(coorte) {
+    cli <- clinical_combined[clinical_combined$cohort == coorte, ]
+    data.frame(
+      Arquivo    = "TNBC_harmonized.RData",
+      Coorte     = coorte,
+      Tecnologia = "RNA-seq",
+      Tumor      = sum(cli$tipo == "tumor",  na.rm = TRUE),
+      Normal     = sum(cli$tipo == "normal", na.rm = TRUE),
+      pCR        = NA_integer_,
+      RD         = NA_integer_,
+      Total      = nrow(cli),
+      Genes      = nrow(counts_harmonized),
+      Desfecho   = "Tumor vs Normal",
+      stringsAsFactors = FALSE
+    )
+  })),
+
+  # GSE163882
+  data.frame(
+    Arquivo    = "TNBC_gse163882.RData",
+    Coorte     = "GSE163882",
+    Tecnologia = "RNA-seq",
+    Tumor      = ncol(counts_163882),
+    Normal     = 0L,
+    pCR        = sum(clinical_163882$nac_response == "pCR", na.rm = TRUE),
+    RD         = sum(clinical_163882$nac_response == "RD",  na.rm = TRUE),
+    Total      = ncol(counts_163882),
+    Genes      = nrow(counts_163882),
+    Desfecho   = "pCR vs RD",
+    stringsAsFactors = FALSE
+  ),
+
+  # Microarray: uma linha por coorte
+  do.call(rbind, lapply(unique(clinical_array$cohort), function(coorte) {
+    cli <- clinical_array[clinical_array$cohort == coorte, ]
+    data.frame(
+      Arquivo    = "TNBC_microarray.RData",
+      Coorte     = coorte,
+      Tecnologia = "Microarray",
+      Tumor      = nrow(cli),
+      Normal     = 0L,
+      pCR        = sum(cli$nac_response == "pCR", na.rm = TRUE),
+      RD         = sum(cli$nac_response == "RD",  na.rm = TRUE),
+      Total      = nrow(cli),
+      Genes      = nrow(expr_harmonized_array),
+      Desfecho   = "pCR vs RD",
+      stringsAsFactors = FALSE
+    )
+  })),
+
+  # GSE32603
+  data.frame(
+    Arquivo    = "TNBC_gse32603.RData",
+    Coorte     = "GSE32603",
+    Tecnologia = "Microarray",
+    Tumor      = ncol(expr_32603_tnbc),
+    Normal     = 0L,
+    pCR        = sum(clinical_32603$nac_response == "pCR", na.rm = TRUE),
+    RD         = sum(clinical_32603$nac_response == "RD",  na.rm = TRUE),
+    Total      = ncol(expr_32603_tnbc),
+    Genes      = nrow(expr_32603_tnbc),
+    Desfecho   = "pCR vs RD (longitudinal T1/T2/TS)",
+    stringsAsFactors = FALSE
+  )
+)
+
+rownames(resumo) <- NULL
+print(resumo)
+
+library(ggpubr)
+
+# Preparar dados
+resumo_display <- resumo
+resumo_display[is.na(resumo_display)] <- "-"
+
+# Colunas a mostrar (sem Arquivo e Plataforma que ficam redundantes)
+cols <- c("Coorte", "Tecnologia", "Tumor", "Normal", "pCR", "RD", "Total", "Genes", "Desfecho")
+
+fig_tabela <- ggtexttable(
+  resumo_display[, cols],
+  rows  = NULL,
+  theme = ttheme(
+    colnames.style = colnames_style(fill = "#2c5f8a", color = "white",
+                                    face = "bold", size = 9),
+    tbody.style    = tbody_style(fill  = c("white", "#edf3fa"),
+                                 color = "black", size = 9)
+  )
+)
+
+ggsave(
+  filename    = file.path(processed_dir, "resumo_datasets.tiff"),
+  plot        = fig_tabela,
+  width       = 7, height = 3, units = "in",
+  dpi         = 300, bg = "white", compression = "lzw"
+)
+
+```

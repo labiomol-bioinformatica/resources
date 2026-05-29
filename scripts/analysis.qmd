@@ -1,0 +1,279 @@
+---
+title: "Análise diferencial de expressão - TNBC"
+format: html
+editor: visual
+editor_options:
+  chunk_output_type: console
+---
+
+## O que este script faz
+
+Recebe os arquivos produzidos pelo `download_geo.qmd` e realiza três análises:
+
+1.  **DESeq2 - tumor vs normal** (`TNBC_harmonized.RData`): identifica genes diferencialmente expressos em TNBC comparado a tecido mamário normal.
+2.  **DESeq2 - pCR vs RD, RNA-seq** (`TNBC_gse163882.RData`): associação de expressão com resposta à quimioterapia neoadjuvante na coorte GSE163882.
+3.  **limma - pCR vs RD, microarray** (`TNBC_microarray.RData`): mesma pergunta nos 4 datasets Affymetrix harmonizados (\~300 pacientes).
+
+------------------------------------------------------------------------
+
+## 1. Pacotes
+
+```{r}
+#| eval: false
+
+BiocManager::install(c("DESeq2", "limma"))
+install.packages("ggrepel")
+```
+
+```{r}
+#| message: false
+
+library(DESeq2)
+library(limma)
+library(ggplot2)
+library(ggrepel)
+```
+
+## 2. Carregar dados
+
+```{r}
+data_dir <- "../data/processed/"
+
+# tumor vs normal (RNA-seq)
+# carrega: counts_harmonized, clinical_combined
+load(file.path(data_dir, "rnaseq", "TNBC_harmonized.RData"))
+counts   <- counts_harmonized
+clinical <- clinical_combined
+
+# pCR vs RD - RNA-seq
+# carrega: counts_163882, clinical_163882
+load(file.path(data_dir, "rnaseq", "TNBC_gse163882.RData"))
+counts_val   <- counts_163882
+clinical_val <- clinical_163882
+
+# pCR vs RD - microarray
+# carrega: expr_harmonized_array, clinical_array
+load(file.path(data_dir, "microarray", "TNBC_microarray.RData"))
+expr_array   <- expr_harmonized_array
+clinical_arr <- clinical_array
+```
+
+------------------------------------------------------------------------
+
+## 3. DESeq2 - tumor vs normal
+
+### 3a. Montar objeto e rodar
+
+```{r}
+# ComBat-seq preserva inteiros, mas arredondamento em ponto flutuante pode gerar
+# valores como 999.9999 - o round() garante que o DESeq2 não reclame
+dds <- DESeqDataSetFromMatrix(
+  countData = round(counts),
+  colData   = clinical,
+  design    = ~ tipo
+)
+
+# "normal" como referência: fold change positivo = maior expressão no tumor
+dds$tipo <- relevel(dds$tipo, ref = "normal")
+
+dds <- DESeq(dds)
+```
+
+### 3b. Extrair resultados
+
+```{r}
+res <- results(dds, contrast = c("tipo", "tumor", "normal"))
+res_df <- as.data.frame(na.omit(res))
+res_df <- res_df[order(res_df$padj), ]
+
+cat("Genes testados:", nrow(res_df), "\n")
+cat("Significativos (padj < 0.05, |LFC| > 1):",
+    sum(res_df$padj < 0.05 & abs(res_df$log2FoldChange) > 1), "\n")
+head(res_df)
+```
+
+```{r}
+saveRDS(res_df, file.path(data_dir, "TNBC_DESeq2_tumor_vs_normal.rds"))
+```
+
+### 3c. Volcano plot
+
+```{r}
+p_cutoff  <- 0.05
+fc_cutoff <- 1
+
+res_df$grupo <- "Nao significativo"
+res_df$grupo[res_df$padj < p_cutoff & res_df$log2FoldChange >  fc_cutoff] <- "Up no tumor"
+res_df$grupo[res_df$padj < p_cutoff & res_df$log2FoldChange < -fc_cutoff] <- "Down no tumor"
+
+top15 <- head(res_df[res_df$grupo != "Nao significativo", ], 15)
+top15$gene <- rownames(top15)
+
+ggplot(res_df, aes(log2FoldChange, -log10(padj), color = grupo)) +
+  geom_point(alpha = 0.5, size = 1.2) +
+  scale_color_manual(values = c(
+    "Up no tumor"       = "#d73027",
+    "Down no tumor"     = "#4575b4",
+    "Nao significativo" = "grey80"
+  )) +
+  geom_vline(xintercept = c(-fc_cutoff, fc_cutoff), linetype = "dashed", alpha = 0.5) +
+  geom_hline(yintercept = -log10(p_cutoff),          linetype = "dashed", alpha = 0.5) +
+  geom_text_repel(data = top15, aes(label = gene),
+                  size = 3, color = "black", box.padding = 0.4, max.overlaps = Inf) +
+  labs(title = "Tumor vs Normal - TNBC",
+       x = "Log2 Fold Change", y = "-Log10 (padj)", color = NULL) +
+  theme_bw() + theme(legend.position = "bottom")
+```
+
+------------------------------------------------------------------------
+
+## 4. DESeq2 - pCR vs RD (GSE163882, RNA-seq)
+
+### 4a. Filtrar amostras com desfecho definido
+
+```{r}
+# mantém só pCR e RD - descarta NAs e outras categorias
+idx_val <- !is.na(clinical_val$nac_response) &
+           clinical_val$nac_response %in% c("pCR", "RD")
+
+clinical_val <- clinical_val[idx_val, ]
+counts_val   <- counts_val[, rownames(clinical_val)]
+
+clinical_val$nac_response <- factor(clinical_val$nac_response, levels = c("RD", "pCR"))
+
+cat("pCR:", sum(clinical_val$nac_response == "pCR"),
+    "| RD:", sum(clinical_val$nac_response == "RD"), "\n")
+```
+
+### 4b. Rodar e extrair
+
+```{r}
+# GSE163882 tem Ensembl IDs como rownames - mantém assim para DESeq2
+# a conversão para símbolo é feita depois, na tabela de resultados
+dds_val <- DESeqDataSetFromMatrix(
+  countData = round(counts_val),
+  colData   = clinical_val,
+  design    = ~ nac_response
+)
+
+dds_val <- DESeq(dds_val)
+
+res_val <- results(dds_val, contrast = c("nac_response", "pCR", "RD"))
+res_val_df <- as.data.frame(na.omit(res_val))
+res_val_df <- res_val_df[order(res_val_df$padj), ]
+
+cat("Genes testados:", nrow(res_val_df), "\n")
+cat("Significativos (padj < 0.05, |LFC| > 1):",
+    sum(res_val_df$padj < 0.05 & abs(res_val_df$log2FoldChange) > 1), "\n")
+```
+
+```{r}
+# converte Ensembl ID para símbolo gênico na tabela de resultados
+library(org.Hs.eg.db)
+
+simbolos_val <- mapIds(
+  org.Hs.eg.db,
+  keys      = rownames(res_val_df),
+  column    = "SYMBOL",
+  keytype   = "ENSEMBL",
+  multiVals = "first"
+)
+res_val_df$gene <- ifelse(is.na(simbolos_val), rownames(res_val_df), simbolos_val)
+
+saveRDS(res_val_df, file.path(data_dir, "TNBC_DESeq2_pCR_vs_RD_rnaseq.rds"))
+head(res_val_df)
+```
+
+### 4c. Volcano plot
+
+```{r}
+res_val_df$grupo <- "Nao significativo"
+res_val_df$grupo[res_val_df$padj < p_cutoff & res_val_df$log2FoldChange >  fc_cutoff] <- "Associado a pCR"
+res_val_df$grupo[res_val_df$padj < p_cutoff & res_val_df$log2FoldChange < -fc_cutoff] <- "Associado a RD"
+
+top15_val <- head(res_val_df[res_val_df$grupo != "Nao significativo", ], 15)
+
+ggplot(res_val_df, aes(log2FoldChange, -log10(padj), color = grupo)) +
+  geom_point(alpha = 0.5, size = 1.2) +
+  scale_color_manual(values = c(
+    "Associado a pCR"   = "#1a9850",
+    "Associado a RD"    = "#d73027",
+    "Nao significativo" = "grey80"
+  )) +
+  geom_vline(xintercept = c(-fc_cutoff, fc_cutoff), linetype = "dashed", alpha = 0.5) +
+  geom_hline(yintercept = -log10(p_cutoff),          linetype = "dashed", alpha = 0.5) +
+  geom_text_repel(data = top15_val, aes(label = gene),
+                  size = 3, color = "black", box.padding = 0.4, max.overlaps = Inf) +
+  labs(title = "pCR vs RD - GSE163882 (RNA-seq)",
+       subtitle = "Fold change positivo = maior expressao em pCR",
+       x = "Log2 Fold Change", y = "-Log10 (padj)", color = NULL) +
+  theme_bw() + theme(legend.position = "bottom")
+```
+
+------------------------------------------------------------------------
+
+## 5. limma - pCR vs RD (microarray, 4 cohorts)
+
+### 5a. Filtrar amostras com desfecho definido
+
+```{r}
+idx_arr <- !is.na(clinical_arr$nac_response) &
+           toupper(clinical_arr$nac_response) %in% c("PCR", "RD")
+
+clinical_arr <- clinical_arr[idx_arr, ]
+expr_sub_arr <- expr_array[, rownames(clinical_arr)]
+
+# padroniza para maiúsculas e define RD como referência
+resposta <- factor(toupper(clinical_arr$nac_response), levels = c("RD", "PCR"))
+
+cat("pCR:", sum(resposta == "PCR"), "| RD:", sum(resposta == "RD"), "\n")
+```
+
+### 5b. Rodar e extrair
+
+```{r}
+design_arr <- model.matrix(~ resposta)
+colnames(design_arr) <- c("Intercept", "pCR_vs_RD")
+
+fit <- lmFit(expr_sub_arr, design_arr)
+fit <- eBayes(fit)
+
+res_limma <- topTable(fit, coef = "pCR_vs_RD", number = Inf, adjust.method = "BH")
+res_limma$gene <- rownames(res_limma)
+
+cat("Genes testados:", nrow(res_limma), "\n")
+cat("Significativos (adj.P.Val < 0.05, |logFC| > 0.58):",
+    sum(res_limma$adj.P.Val < 0.05 & abs(res_limma$logFC) > 0.58), "\n")
+
+saveRDS(res_limma, file.path(data_dir, "TNBC_limma_pCR_vs_RD_microarray.rds"))
+head(res_limma)
+```
+
+### 5c. Volcano plot
+
+```{r}
+# para microarray o logFC de 0.58 equivale a ~1.5x de diferenca real
+fc_cutoff_arr <- 0.58
+
+res_limma$grupo <- "Nao significativo"
+res_limma$grupo[res_limma$adj.P.Val < p_cutoff & res_limma$logFC >  fc_cutoff_arr] <- "Associado a pCR"
+res_limma$grupo[res_limma$adj.P.Val < p_cutoff & res_limma$logFC < -fc_cutoff_arr] <- "Associado a RD"
+
+top15_arr <- head(res_limma[res_limma$grupo != "Nao significativo", ], 15)
+
+ggplot(res_limma, aes(logFC, -log10(adj.P.Val), color = grupo)) +
+  geom_point(alpha = 0.5, size = 1.2) +
+  scale_color_manual(values = c(
+    "Associado a pCR"   = "#1a9850",
+    "Associado a RD"    = "#d73027",
+    "Nao significativo" = "grey80"
+  )) +
+  geom_vline(xintercept = c(-fc_cutoff_arr, fc_cutoff_arr), linetype = "dashed", alpha = 0.5) +
+  geom_hline(yintercept = -log10(p_cutoff),                  linetype = "dashed", alpha = 0.5) +
+  geom_text_repel(data = top15_arr, aes(label = gene),
+                  size = 3, color = "black", box.padding = 0.4, max.overlaps = Inf) +
+  labs(title = "pCR vs RD - Microarray harmonizado (4 cohorts)",
+       subtitle = "Fold change positivo = maior expressao em pCR",
+       x = "Log2 Fold Change", y = "-Log10 (adj.P.Val)", color = NULL) +
+  theme_bw() + theme(legend.position = "bottom")
+```
